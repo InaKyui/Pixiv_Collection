@@ -1,160 +1,144 @@
-# python pixiv_venv
-# -*- encoding: utf-8 -*-
-'''
-[File]    :   pixiv.py
-[Time]    :   2022/10/13 00:20:55
-[Author]  :   InaKyui
-[Version] :   1.0
-[Contact] :   https://github.com/InaKyui
-[License] :   (C)Copyright 2022, InaKyui
-'''
+#-*- encoding: utf-8 -*-
+#!/usr/bin/pixiv_venv python3.7
+"""
+[File]        : pixiv.py
+[Time]        : 2023/06/07 18:00:00
+[Author]      : InaKyui
+[License]     : (C)Copyright 2023, InaKyui
+[Version]     : 2.0
+[Description] : Class pixiv.
+"""
+
+__authors__ = ["InaKyui <https://github.com/InaKyui>"]
+__version__ = "Version: 2.0"
 
 import os
+import re
+import json
 import time
-import aiohttp
-import asyncio
-import requests
+import random
 import sqlite3
+import datetime
+import requests
+from selenium import webdriver
 
-GET_AUTHOR_ID_LIST_API = "https://www.pixiv.net/ajax/user"
-GET_ORIGINAI_JPG_API = "https://i.pximg.net/img-original/img/"
-GET_LIST_API = "https://www.pixiv.net/ajax/tags/frequent/illust"
+# Disable warnings from requests.
+requests.packages.urllib3.disable_warnings()
 
-class pixiv:
-    def __init__(self, headers:dict, pixiv_db:sqlite3.Connection, download_path:str):
-        # headers       : web request header.
-        # pixiv_db      : record download information.
-        # download_path : local image save path.
-        # image_list    : cache image list.
-        self.__headers = headers
-        self.__pixiv_db = pixiv_db
-        self.__download_path = os.path.join(download_path, time.strftime("%H_%M_%S", time.localtime()))
-        self.__image_list = []
+class Pixiv:
+    def __init__(self, database:sqlite3.Connection) -> None:
+        self.__config = None
+        self.__load_config()
+        self.headers = {
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
+            "Referer": "https://www.pixiv.net/"
+        }
+        self.database = database
+        self.session = requests.Session()
 
-        # Create download folder.
-        if not os.path.exists(self.__download_path):
-            os.makedirs(self.__download_path)
+        daily = {
+            "Type": "daily",
+            "URL": "https://www.pixiv.net/ranking.php?mode=daily&date={0}&p={1}",
+            "Page": 10
+        }
+        daily_ai = {
+            "Type": "daily_ai",
+            "URL": "https://www.pixiv.net/ranking.php?mode=daily_ai&date={0}&p={1}",
+            "Page": 1
+        }
+        daily_r18 = {
+            "Type": "daily_r18",
+            "URL": "https://www.pixiv.net/ranking.php?mode=daily_r18&date={0}&p={1}",
+            "Page": 2
+        }
+        daily_ai_r18 = {
+            "Type": "daily_r18_ai",
+            "URL": "https://www.pixiv.net/ranking.php?mode=daily_r18_ai&date={0}&p={1}",
+            "Page": 1
+        }
+        self.__task = [daily, daily_ai, daily_r18, daily_ai_r18]
 
-    def __link_api(self, url, data=None):
-        # Return requests data.
-        try:
-            res = requests.get(url=url, data=data, headers=self.__headers)
-            self.__print_message("Success", "Connection success.")
-        except:
-            self.__print_message("Error", "Connection failure.")
-        return res.json()
+    def __load_config(self) -> None:
+        with open(os.path.join(os.getcwd(), "config.json"), "r", encoding="utf8") as fr:
+            self.__config = json.load(fr)
 
-    def __save_image_id(self, id:int, download_flag:bool):
-        # Save image info.
-        spl = "INSERT INTO save_pixiv_jpg (id, download_flag, download_time) VALUES ('{0}','{1}',{2});".format(
-            (id, download_flag, time.strftime("%Y%m%d", time.localtime())))
-        self.__pixiv_db.execute(spl)
-        self.__pixiv_db.commit()
+    def __get_cookie(self):
+        chrome_cmd = "{0} --remote-debugging-port=9222 --user-data-dir={1}".format(self.__config["chrome"], os.path.join(os.getcwd(), "selenium\chrome"))
+        os.popen(chrome_cmd)
 
-    def __search_image_id(self, id):
-        # Find image info from datebase.
-        # Return: if data == none: True else: False
-        spl = "SELECT * FROM save_pixiv_jpg WHERE id = {0};".format(id)
-        data = self.__pixiv_db.execute(spl)
-        if not data.fetchall():
-            return True
+        options = webdriver.ChromeOptions()
+        options.debugger_address = "127.0.0.1:9222"
+        browser = webdriver.Chrome(options=options)
+        time.sleep(3)
+        browser.get("https://www.pixiv.net/ranking.php")
+        time.sleep(10)
+        cookie_lst = []
+        for item in browser.get_cookies():
+            cookie_lst.append("{}={}".format(item["name"], item["value"]))
+        cookie = ";".join(cookie_lst)
+        self.headers["cookie"] = cookie
+
+    def __get_artworks(self, task:dict) -> list:
+        artworks = []
+        if int(datetime.datetime.now().strftime("%H")) < 12:
+            last_date = (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y%m%d")
         else:
-            return False
+            last_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y%m%d")
+        for page in range(task["Page"]):
+            daily_url = task["URL"].format(last_date, str(page + 1))
+            daily_res = self.session.get(url=daily_url, headers=self.headers, verify=False)
+            rank_ptn = re.compile("data-attr=\".*?\" data-id=\".*?\"")
+            for artwork in rank_ptn.findall(daily_res.text):
+                artworks.append(artwork.split("data-id=\"")[1].split("\"")[0])
+        return artworks
 
-    def __print_message(self, status:str, message:str):
-        print("[{0}][{1}] {2}".format(time.strftime("%H:%M:%S", time.localtime()), status, message))
+    def __get_images(self, artworks:list) -> list:
+        images = []
+        for artwork in artworks:
+            time.sleep(random.randint(1,3) / 10)
+            # Get image url.
+            artwork_url = "https://www.pixiv.net/artworks/" + artwork
+            art_rsp = self.session.get(url=artwork_url, headers=self.headers, verify=False)
+            # art_ptn = re.compile("\"urls\":\S+?}")
+            img_ptn = re.compile("\"original\"\S*[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9]{2}/[0-9]{2}/[0-9]{2}/[0-9]{9}_p[0-9]\.\S{3,4}\"")
+            cfs_lst = img_ptn.findall(art_rsp.text)
+            # \"pageCount\":[0-9]+,
+            # Non-moving images.
+            if cfs_lst == []:
+                print("[Fail] {}".format(artwork_url))
+                continue
+            else:
+                image_url = cfs_lst[0].split("\"")[3]
+            images.append(image_url)
+        return images
 
-    def __pixiv_get_id_list(self, mode, date):
-        # Get image list.
-        url, image_id_list_tar, image_http_list, http_ = "",[],[],""
-        if mode == "author":
-            url = os.path.join(GET_AUTHOR_ID_LIST_API, "/{0}/profile/all?lang=zh".format(date))
-            http_ = "https://www.pixiv.net/ajax/user/{0}/profile/illusts?".format(date)
-        elif mode == "daily":
-            url = "https://www.pixiv.net/ranking.php?mode=daily&date={0}".format(date)
+    def download(self):
+        self.__get_cookie()
 
-        data = self.__link_api(url)
-        image_id_list_ori = list(data['body']['illusts'].keys())
-        self.__print_message("Debug", "Image List: {0}".format(str(image_id_list_ori)))
+        for task in self.__task:
+            download_path = os.path.join(os.getcwd(), "images", task["Type"], datetime.datetime.now().strftime("%Y%m%d"))
+            if not os.path.exists(download_path):
+                os.mkdir(download_path)
 
-        # Uniq image.
-        for image_id in image_id_list_ori:
-            self.__print_message("Debug", "Image ID: {0}".format(image_id))
-            if self.__search_image_id(image_id):
-                image_id_list_tar.append(image_id)
-        # Get image.
-        for target_id in image_id_list_tar:
-            http = http_
-            http += "ids%5B%5D=" + target_id + "&"
-            image_http_list.append(http + "work_category=illustManga&is_first_page=0&lang=zh")
+            artworks = self.__get_artworks(task)
+            images = self.__get_images(artworks)
+            fail_images = []
+            for image_url in images:
+                try:
+                    time.sleep(random.randint(5,10) / 10)
+                    img_rsp = self.session.get(url=image_url, headers=self.headers, verify=False)
+                    with open(os.path.join(download_path, image_url.split("/")[-1]), "wb") as fw:
+                        fw.write(img_rsp.content)
+                except:
+                    fail_images.append(image_url)
 
-        return image_http_list
+            for fiu in fail_images:
+                try:
+                    time.sleep(random.randint(5,10) / 10)
+                    img_rsp = self.session.get(url=fiu, headers=self.headers, verify=False)
+                    with open(os.path.join(download_path, fiu.split("/")[-1]), "wb") as fw:
+                        fw.write(img_rsp.content)
+                except:
+                    print("[Fail] {}".format(image_url))
 
-    def pixiv_get_list(self, mode, date):
-        image_list = []
-        image_http_list = self.__pixiv_get_id_list(mode, date)
-        for image_http in image_http_list:
-            self.__print_message("Debug", "Image Http: {0}".format(image_http))
-            data = self.__link_api(image_http)['body']['works']
-            for image in data:
-                image_address = GET_ORIGINAI_JPG_API + data[image]["url"].split("/", 7)[-1].replace("_custom1200", "").replace("_square1200","")
-                image_list.append(image_address)
-                self.__print_message("Debug", "Image Address: {0}".format(image_address))
 
-        self.__image_list = image_list
-        self.__print_message("Debug", "Image List: {0}".format(str(self.__image_list)))
-
-    def __download_image(self, image_url):
-        self.__print_message("Debug", "Url {0}".format(image_url))
-        res = requests.get(url=image_url, headers=self.__headers)
-        image_name = image_url.split("/")[-1]
-
-        if res.status_code == 404:
-            self.__print_message("Done", "%s 404 try png..." % image_name)
-            image_name = image_name.replace('.jpg', '.png')
-            res = requests.get(url=image_url.replace('.jpg', '.png'), headers=self.__headers)
-
-        with open(os.path.join(self.__download_path, image_name), "wb") as image:
-            image.write(res.content)
-
-        # self.__save_image_id(image_name.split("_", 1)[0], image_url)
-
-    async def __async_download_image(self, image_url:str, limit:int):
-        url_list = []
-        conn = aiohttp.TCPConnector(limit=limit)
-
-        async def download_image(session, url):
-            self.__print_message("Debug", "Url {0}".format(url))
-            async with session.get(url, headers=self.__headers, verify_ssl=False) as res:
-                image_name = str(res.url).split("/")[-1]
-                self.__print_message("Debug", "Status {0}".format(res.status))
-                if not res.status == 404:
-                    content = await res.content.read()
-                    with open(os.path.join(self.__download_path, image_name), "wb") as image:
-                        image.write(content)
-                    self.__save_image_id(image_name.split("_")[0], image_url)
-                    self.__print_message("Done", "Remain {0}".format(str(len(self.__image_list))))
-                elif res.status == 404:
-                    self.__print_message("Done", "%s 404 try png..." % image_name)
-                    url_list.append(str(res.url).replace("jpg", "png"))
-
-        async with aiohttp.ClientSession(connector=conn) as session:
-            tasks = [asyncio.create_task(download_image(session, image)) for image in [image_url]]
-            await asyncio.wait(tasks)
-
-            if not url_list == []:
-                await self.__async_download_image(image_url, url_list, limit=limit)
-
-    def download(self,async_http = False,limit=10):
-        self.__print_message("Download", "Start...%s"%str(len(self.__image_list)))
-        for image_url in self.__image_list:
-            if not image_url == "":
-                if async_http:
-                    try:
-                        asyncio.run(self.__async_download_image(image_url, limit=limit))
-                    except RuntimeError:
-                        pass
-                else:
-                    self.__download_image(image_url)
-        self.__print_message("Done", "Download completed.")
-        self.__image_list = []
