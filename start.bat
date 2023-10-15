@@ -1,1 +1,1 @@
-python main.py
+.\venv\Scripts\python main.py --start_time "20231010"

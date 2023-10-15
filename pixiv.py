@@ -2,31 +2,31 @@
 #!/usr/bin/pixiv_venv python3.7
 """
 [File]        : pixiv.py
-[Time]        : 2023/06/07 18:00:00
+[Time]        : 2023/10/10 18:00:00
 [Author]      : InaKyui
 [License]     : (C)Copyright 2023, InaKyui
-[Version]     : 2.0
+[Version]     : 2.1
 [Description] : Class pixiv.
 """
 
 __authors__ = ["InaKyui <https://github.com/InaKyui>"]
-__version__ = "Version: 2.0"
+__version__ = "Version: 2.1"
 
 import os
 import re
 import json
 import time
 import random
-import sqlite3
 import datetime
 import requests
+from database import Database
 from selenium import webdriver
 
 # Disable warnings from requests.
 requests.packages.urllib3.disable_warnings()
 
 class Pixiv:
-    def __init__(self, database:sqlite3.Connection) -> None:
+    def __init__(self, database:Database) -> None:
         self.__config = None
         self.__load_config()
         self.headers = {
@@ -65,37 +65,35 @@ class Pixiv:
     def __get_cookie(self):
         chrome_cmd = "{0} --remote-debugging-port=9222 --user-data-dir={1}".format(self.__config["chrome"], os.path.join(os.getcwd(), "selenium\chrome"))
         os.popen(chrome_cmd)
-
         options = webdriver.ChromeOptions()
         options.debugger_address = "127.0.0.1:9222"
         browser = webdriver.Chrome(options=options)
         time.sleep(3)
         browser.get("https://www.pixiv.net/ranking.php")
-        time.sleep(10)
+        time.sleep(60)
         cookie_lst = []
         for item in browser.get_cookies():
             cookie_lst.append("{}={}".format(item["name"], item["value"]))
         cookie = ";".join(cookie_lst)
         self.headers["cookie"] = cookie
 
-    def __get_artworks(self, task:dict) -> list:
+    def __get_artworks(self, date:str, task:dict) -> list:
         artworks = []
-        if int(datetime.datetime.now().strftime("%H")) < 12:
-            last_date = (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y%m%d")
-        else:
-            last_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y%m%d")
         for page in range(task["Page"]):
-            daily_url = task["URL"].format(last_date, str(page + 1))
+            daily_url = task["URL"].format(date, str(page + 1))
             daily_res = self.session.get(url=daily_url, headers=self.headers, verify=False)
             rank_ptn = re.compile("data-attr=\".*?\" data-id=\".*?\"")
-            for artwork in rank_ptn.findall(daily_res.text):
-                artworks.append(artwork.split("data-id=\"")[1].split("\"")[0])
+            for rp in rank_ptn.findall(daily_res.text):
+                artwork = rp.split("data-id=\"")[1].split("\"")[0]
+                artworks.append(artwork)
+                print("[Get] Artwork: {}".format(artwork))
         return artworks
 
     def __get_images(self, artworks:list) -> list:
         images = []
         for artwork in artworks:
-            time.sleep(random.randint(1,3) / 10)
+            image_info = {}
+            time.sleep(random.randint(3,5) / 10)
             # Get image url.
             artwork_url = "https://www.pixiv.net/artworks/" + artwork
             art_rsp = self.session.get(url=artwork_url, headers=self.headers, verify=False)
@@ -108,37 +106,69 @@ class Pixiv:
                 print("[Fail] {}".format(artwork_url))
                 continue
             else:
+                # TODO Single image -> Multi image.
                 image_url = cfs_lst[0].split("\"")[3]
-            images.append(image_url)
+            # Collecting image information.
+            image_info["name"] = image_url.split("/")[-1]
+            image_info["url"] = image_url
+            image_info["artwork"] = artwork
+            date_ptn = re.compile("[0-9]{4}\/[0-9]{2}\/[0-9]{2}\/[0-9]{2}\/[0-9]{2}\/[0-9]{2}")
+            date_lst = date_ptn.findall(image_url)
+            image_info["upload_time"] = date_lst[0].replace("/", "-") if date_lst else ""
+            images.append(image_info)
+            print("[Get] Image: {}".format(image_info["url"]))
         return images
 
-    def download(self):
+    def download_image(self, download_path:str, image_info:dict):
+        img_rsp = self.session.get(url=image_info["url"], headers=self.headers, verify=False)
+        with open(os.path.join(download_path, image_info["url"].split("/")[-1]), "wb") as fw:
+            fw.write(img_rsp.content)
+        # Supplement and insert image information.
+        image_info["download_time"] = datetime.datetime.now()
+        self.database.insert_image(image_info)
+        time.sleep(random.randint(10, 15) / 10)
+        print("[Download] Image: {}".format(image_info["url"]))
+
+    def download(self, start_date, end_date):
         self.__get_cookie()
-
-        for task in self.__task:
-            download_path = os.path.join(os.getcwd(), "images", task["Type"], datetime.datetime.now().strftime("%Y%m%d"))
-            if not os.path.exists(download_path):
-                os.mkdir(download_path)
-
-            artworks = self.__get_artworks(task)
-            images = self.__get_images(artworks)
-            fail_images = []
-            for image_url in images:
-                try:
-                    time.sleep(random.randint(5,10) / 10)
-                    img_rsp = self.session.get(url=image_url, headers=self.headers, verify=False)
-                    with open(os.path.join(download_path, image_url.split("/")[-1]), "wb") as fw:
-                        fw.write(img_rsp.content)
-                except:
-                    fail_images.append(image_url)
-
-            for fiu in fail_images:
-                try:
-                    time.sleep(random.randint(5,10) / 10)
-                    img_rsp = self.session.get(url=fiu, headers=self.headers, verify=False)
-                    with open(os.path.join(download_path, fiu.split("/")[-1]), "wb") as fw:
-                        fw.write(img_rsp.content)
-                except:
-                    print("[Fail] {}".format(image_url))
-
-
+        print("[Start] Download.")
+        # Leaderboard is updated at 12:00 p.m..
+        if int(datetime.datetime.now().strftime("%H")) < 12:
+            last_date = (datetime.datetime.now() - datetime.timedelta(days=2))
+        else:
+            last_date = (datetime.datetime.now() - datetime.timedelta(days=1))
+        # Whichever is earlier.
+        start_date = last_date if last_date < start_date else start_date
+        last_date = last_date if last_date < end_date else end_date
+        # Closed interval.
+        apart_days = last_date.__sub__(start_date).days + 1
+        # Download images.
+        for i in range(apart_days):
+            cur_date = (start_date + datetime.timedelta(days=i)).strftime("%Y%m%d")
+            # Determine whether the current date has been downloaded.
+            if not self.database.select_date(cur_date):
+                for task in self.__task:
+                    # Determine whether the download path exists.
+                    download_path = os.path.join(os.getcwd(), "images", task["Type"], cur_date)
+                    if not os.path.exists(download_path):
+                        os.makedirs(download_path)
+                    # Date -> [artworks] -> [images].
+                    artworks = self.__get_artworks(cur_date, task)
+                    images = self.__get_images(artworks)
+                    failure_images = []
+                    for iu in images:
+                        # Determine whether the image has been downloaded.
+                        if not self.database.select_image(iu["name"]):
+                            try:
+                                iu["type"] = task["Type"]
+                                self.download_image(download_path, iu)
+                            except:
+                                failure_images.append(iu)
+                    # Second retry for failure images.
+                    for fiu in failure_images:
+                        try:
+                            fiu["type"] = task["Type"]
+                            self.download_image(download_path, fiu)
+                        except:
+                            print("[Fail] {}".format(fiu["url"]))
+                self.database.insert_date(cur_date)
